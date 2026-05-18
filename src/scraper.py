@@ -2,7 +2,7 @@
 """
 wiki-scraper — snapshot tool for the tgstation13 wiki at a target historical date.
 
-Three subcommands cover the workflow:
+Four subcommands cover the workflow:
 
   filter    Take a MediaWiki Special:Export XML dump (one with full history)
             and emit a new XML containing exactly one revision per page —
@@ -21,6 +21,11 @@ Three subcommands cover the workflow:
             output is wikitext recovered from `?action=raw` captures where
             available.
 
+  images    Download the file binaries referenced by File-namespace pages
+            in an export XML, layout-matched to MediaWiki's md5-keyed
+            /images/<a>/<ab>/ tree. Run importImages.php on the result
+            to ingest them into a target wiki.
+
 The default policy (overridable per command):
   TARGET = 2021-01-01T00:00:00Z   — pick the revision closest to this
   CUTOFF = 2022-01-01T00:00:00Z   — drop pages with no revision before this
@@ -34,6 +39,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import gzip
+import hashlib
 import io
 import json
 import sys
@@ -535,6 +541,119 @@ def cmd_wayback(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- images subcommand: pull file binaries -----------------------------------
+
+def canonical_filename(name: str) -> str:
+    """MediaWiki canonicalizes filenames before hashing: spaces -> underscores,
+    first char capitalized. Both transforms are what the wiki uses when it
+    stores files on disk; mirror them so the md5 prefix matches."""
+    if not name:
+        return name
+    name = name.replace(" ", "_")
+    return name[0].upper() + name[1:]
+
+
+def file_disk_path(filename: str) -> tuple[str, str, str]:
+    """Return the (single_letter, two_letter, filename) tuple MediaWiki uses
+    to lay out a file on disk: /images/<a>/<ab>/<filename>. Both dir names are
+    prefixes of md5(canonical_filename)."""
+    canon = canonical_filename(filename)
+    h = hashlib.md5(canon.encode("utf-8")).hexdigest()
+    return h[0], h[:2], canon
+
+
+def iter_file_titles(in_path: Path) -> Iterator[str]:
+    """Yield the bare filename (no 'File:' prefix) for every ns=6 page in
+    the XML at in_path. Streams via iterparse so large dumps don't bloat RAM."""
+    src = _open_maybe_gz(in_path, "rb")
+    try:
+        ctx = ET.iterparse(src, events=("end",))
+        for event, elem in ctx:
+            if _local(elem.tag) != "page":
+                continue
+            title = get_text(elem, "title")
+            ns = get_text(elem, "ns")
+            if ns == "6" and title:
+                # Strip the localized File: prefix. tg's wiki uses "File:";
+                # older dumps may use "Image:". Handle both.
+                if ":" in title:
+                    _prefix, _, bare = title.partition(":")
+                    yield bare
+                else:
+                    yield title
+            elem.clear()
+    finally:
+        src.close()
+
+
+def cmd_images(args: argparse.Namespace) -> int:
+    in_path = Path(args.input)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    titles = list(iter_file_titles(in_path))
+    print(f"Found {len(titles)} File-namespace pages in {in_path}")
+    if args.limit:
+        titles = titles[: args.limit]
+        print(f"Limiting to first {len(titles)} for this run.")
+
+    backend, sess = _http_session(args.user_agent)
+    print(f"HTTP backend: {backend}")
+    if backend != "curl_cffi":
+        print(
+            "WARNING: curl_cffi not installed; Cloudflare will likely 403. "
+            "Install with `pip install curl_cffi`.",
+            file=sys.stderr,
+        )
+
+    ok = 0
+    fail = 0
+    skipped = 0
+    t_start = time.time()
+
+    for i, name in enumerate(titles, start=1):
+        a, ab, canon = file_disk_path(name)
+        url = f"{args.wiki_base.rstrip('/')}/{args.images_path.strip('/')}/{a}/{ab}/{quote(canon)}"
+        out_path = out_dir / canon
+        if out_path.exists() and not args.overwrite:
+            skipped += 1
+            if i % args.progress_every == 0:
+                print(f"[images] {i}/{len(titles)}  skipped (already on disk)")
+            continue
+        try:
+            r = sess.get(url, timeout=30)
+        except Exception as exc:
+            fail += 1
+            print(f"[images] {i}/{len(titles)}  FAIL {name}: {exc}", flush=True)
+            time.sleep(args.delay)
+            continue
+        if r.status_code == 200 and r.content:
+            out_path.write_bytes(r.content)
+            ok += 1
+            if i % args.progress_every == 0:
+                rate = i / max(time.time() - t_start, 0.001)
+                print(
+                    f"[images] {i}/{len(titles)}  ok={ok} fail={fail} skip={skipped} "
+                    f"@ {rate:.1f}/s  last: {canon} ({len(r.content):,} bytes)",
+                    flush=True,
+                )
+        else:
+            fail += 1
+            print(
+                f"[images] {i}/{len(titles)}  FAIL {name}: HTTP {r.status_code}",
+                flush=True,
+            )
+        time.sleep(args.delay)
+
+    elapsed = time.time() - t_start
+    print(
+        f"\n[images] done in {elapsed:.1f}s: ok={ok}, fail={fail}, skipped={skipped}, "
+        f"out={out_dir}",
+        flush=True,
+    )
+    return 0 if fail == 0 else 1
+
+
 # --- argparse setup ----------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -567,6 +686,18 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--wiki-base", default="https://wiki.tgstation13.org", help="Wiki base URL prefix (no trailing slash).")
     w.add_argument("--user-agent", default=DEFAULT_UA)
     w.set_defaults(func=cmd_wayback)
+
+    im = sub.add_parser("images", help="Download File-namespace binaries referenced in an export XML.")
+    im.add_argument("--input", required=True, help="Path to an export XML (.xml or .xml.gz). Filtered or raw both work.")
+    im.add_argument("--output-dir", required=True, help="Directory to write downloaded files into. Files are saved with their canonical filename; importImages.php takes the directory as its argument.")
+    im.add_argument("--wiki-base", default="https://wiki.tgstation13.org", help="Wiki base URL prefix (no trailing slash). Default tgstation13.")
+    im.add_argument("--images-path", default="images", help="Path segment between wiki-base and the md5 directories. Most wikis use 'images'; some use 'w/images'. Default 'images'.")
+    im.add_argument("--user-agent", default=DEFAULT_UA)
+    im.add_argument("--delay", type=float, default=0.2, help="Seconds between downloads (default 0.2).")
+    im.add_argument("--overwrite", action="store_true", help="Re-download files that already exist locally.")
+    im.add_argument("--limit", type=int, default=0, help="Stop after N files. 0 = unlimited.")
+    im.add_argument("--progress-every", type=int, default=50, help="Print a heartbeat every N files (default 50).")
+    im.set_defaults(func=cmd_images)
 
     return ap
 
