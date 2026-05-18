@@ -43,10 +43,16 @@ from typing import Iterable, Iterator
 from urllib.parse import quote, urlencode
 from xml.etree import ElementTree as ET
 
-# MediaWiki XML export namespace. Pages, revisions, and the wrapper all live
-# under this. We pin to 0.10 because importDump.php on MW 1.39+ reads it
-# without complaint and 0.11 isn't universally supported yet.
+# Output namespace for files we generate. We emit 0.10 because importDump.php
+# on MW 1.39+ reads it without complaint and 0.11 isn't universally supported
+# yet across downstream wikis. Input files can be 0.10 OR 0.11 — the iter_*
+# helpers below ignore the namespace when matching tags.
 MW_NS = "http://www.mediawiki.org/xml/export-0.10/"
+
+
+def _local(tag: str) -> str:
+    """Return the local tag name with any XML namespace stripped."""
+    return tag.split("}", 1)[-1] if "}" in tag else tag
 
 DEFAULT_API = "https://wiki.tgstation13.org/api.php"
 DEFAULT_EXPORT = "https://wiki.tgstation13.org/Special:Export"
@@ -80,26 +86,26 @@ def _q(name: str) -> str:
 
 
 def iter_pages(root: ET.Element) -> Iterator[ET.Element]:
-    """Yield every <page> element under the export root, namespace-agnostic
-    (some exports are emitted without the xmlns declaration)."""
-    for page in root.findall(_q("page")):
-        yield page
-    for page in root.findall("page"):
-        yield page
+    """Yield every <page> element under the export root, regardless of which
+    MediaWiki XML namespace the input uses (export-0.10 vs export-0.11)."""
+    for child in root:
+        if _local(child.tag) == "page":
+            yield child
 
 
 def iter_revs(page: ET.Element) -> Iterator[ET.Element]:
-    yield from page.findall(_q("revision"))
-    yield from page.findall("revision")
+    """Same namespace-agnostic walk for <revision> children."""
+    for child in page:
+        if _local(child.tag) == "revision":
+            yield child
 
 
 def get_text(el: ET.Element, name: str) -> str | None:
-    found = el.find(_q(name))
-    if found is None:
-        found = el.find(name)
-    if found is None:
-        return None
-    return found.text
+    """Find a direct child by local tag name, regardless of namespace."""
+    for child in el:
+        if _local(child.tag) == name:
+            return child.text
+    return None
 
 
 def closest_revision(
