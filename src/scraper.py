@@ -43,7 +43,9 @@ import hashlib
 import io
 import json
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Iterator
 from urllib.parse import quote, urlencode
@@ -681,11 +683,14 @@ def cmd_images(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cookies = _parse_cookies(args.cookie)
-    backend, sess = _http_session(
+    # Discovery uses ONE session synchronously (cheap; 1-2 paginated calls).
+    # Downloads use per-thread sessions because curl_cffi.Session is not
+    # thread-safe — concurrent .get() on the same session corrupts state.
+    backend, discover_sess = _http_session(
         args.user_agent, cookies=cookies, impersonate=args.impersonate,
     )
     print(f"HTTP backend: {backend}; cookies set: {list(cookies)}")
-    if backend != "curl_cffi":
+    if backend.split(":")[0] != "curl_cffi":
         print(
             "WARNING: curl_cffi not installed; Cloudflare will likely 403. "
             "Install with `pip install curl_cffi`.",
@@ -702,7 +707,7 @@ def cmd_images(args: argparse.Namespace) -> int:
         print(f"Discovering files via api.php list=allimages "
               f"(cutoff={fmt_ts(cutoff) if cutoff else 'none'})...")
         try:
-            for entry in discover_all_images(args.api, sess, cutoff):
+            for entry in discover_all_images(args.api, discover_sess, cutoff):
                 targets.append(entry)
                 if len(targets) % 500 == 0:
                     print(f"  ... {len(targets)} files enumerated so far", flush=True)
@@ -728,57 +733,116 @@ def cmd_images(args: argparse.Namespace) -> int:
         targets = targets[: args.limit]
         print(f"Limiting to first {len(targets)} for this run.")
 
-    ok = 0
-    fail = 0
-    skipped = 0
-    t_start = time.time()
+    # Pre-skip files already on disk so each worker only does fresh fetches.
+    # --overwrite forces re-download; default is conservative skip-if-exists,
+    # so partial-run resumes don't redo finished work.
+    todo: list[dict] = []
+    skipped_before_start = 0
+    for entry in targets:
+        if (out_dir / entry["name"]).exists() and not args.overwrite:
+            skipped_before_start += 1
+        else:
+            todo.append(entry)
+    if skipped_before_start:
+        print(
+            f"Skipping {skipped_before_start} files already present in {out_dir}. "
+            f"Pass --overwrite to refetch them.",
+        )
+    print(f"Downloading {len(todo)} files with {args.workers} worker(s).")
 
-    for i, entry in enumerate(targets, start=1):
+    # Thread-local curl_cffi sessions. Each thread builds its own on first use
+    # and reuses it for the rest of its assigned tasks; the cf_clearance cookie
+    # is carried into every thread the same way.
+    tlocal = threading.local()
+    def thread_session():
+        sess = getattr(tlocal, "sess", None)
+        if sess is None:
+            _, sess = _http_session(
+                args.user_agent, cookies=cookies, impersonate=args.impersonate,
+            )
+            tlocal.sess = sess
+        return sess
+
+    lock = threading.Lock()
+    counters = {"ok": 0, "fail": 0}
+    t_start = time.time()
+    done_total = 0
+
+    def fetch_one(entry: dict) -> tuple[str, str, int]:
+        """Returns (name, status, bytes). status is 'ok' or 'fail:reason'."""
         name = entry["name"]
         url = entry["url"]
-        # MediaWiki API returns the filename with underscores; preserve that
-        # because importImages.php matches by exact filename including case.
         out_path = out_dir / name
+        # Double-check inside the worker in case the pre-skip scan raced with
+        # another concurrent invocation. Cheap.
         if out_path.exists() and not args.overwrite:
-            skipped += 1
-            if i % args.progress_every == 0:
-                print(
-                    f"[images] {i}/{len(targets)}  skip already-on-disk: {name}",
-                    flush=True,
-                )
-            continue
+            return (name, "skip", 0)
         try:
-            r = sess.get(url, timeout=60)
+            r = thread_session().get(url, timeout=60)
         except Exception as exc:
-            fail += 1
-            print(f"[images] {i}/{len(targets)}  FAIL {name}: {exc}", flush=True)
-            time.sleep(args.delay)
-            continue
+            return (name, f"fail:{exc.__class__.__name__}", 0)
         if r.status_code == 200 and r.content:
-            out_path.write_bytes(r.content)
-            ok += 1
-            if i % args.progress_every == 0:
-                rate = i / max(time.time() - t_start, 0.001)
-                print(
-                    f"[images] {i}/{len(targets)}  ok={ok} fail={fail} skip={skipped} "
-                    f"@ {rate:.1f}/s  last: {name} ({len(r.content):,} bytes)",
-                    flush=True,
-                )
-        else:
-            fail += 1
-            print(
-                f"[images] {i}/{len(targets)}  FAIL {name}: HTTP {r.status_code}",
-                flush=True,
-            )
-        time.sleep(args.delay)
+            # Atomic-ish write: temp then rename, so a partial download under
+            # KeyboardInterrupt doesn't leave a half-byte file on disk that
+            # the skip-if-exists check would then accept on resume.
+            tmp = out_path.with_suffix(out_path.suffix + ".part")
+            tmp.write_bytes(r.content)
+            tmp.replace(out_path)
+            return (name, "ok", len(r.content))
+        return (name, f"fail:HTTP {r.status_code}", 0)
+
+    # If workers == 1, run sequentially so traceback / Ctrl-C is straightforward.
+    if args.workers <= 1:
+        for i, entry in enumerate(todo, start=1):
+            name, status, sz = fetch_one(entry)
+            done_total += 1
+            if status == "ok":
+                counters["ok"] += 1
+                if i % args.progress_every == 0 or i == len(todo):
+                    rate = done_total / max(time.time() - t_start, 0.001)
+                    print(
+                        f"[images] {i}/{len(todo)}  ok={counters['ok']} fail={counters['fail']} "
+                        f"@ {rate:.1f}/s  last: {name} ({sz:,} bytes)",
+                        flush=True,
+                    )
+            elif status.startswith("fail"):
+                counters["fail"] += 1
+                print(f"[images] {i}/{len(todo)}  FAIL {name}: {status[5:]}", flush=True)
+            if args.delay:
+                time.sleep(args.delay)
+    else:
+        # Parallel: submit all, drain in completion order. Per-thread session
+        # pooling means a steady-state of N concurrent TLS connections —
+        # exactly what Cloudflare expects from a browser tab.
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(fetch_one, e): e for e in todo}
+            for i, fut in enumerate(as_completed(futures), start=1):
+                name, status, sz = fut.result()
+                done_total += 1
+                with lock:
+                    if status == "ok":
+                        counters["ok"] += 1
+                    elif status.startswith("fail"):
+                        counters["fail"] += 1
+                if i % args.progress_every == 0 or i == len(todo):
+                    rate = done_total / max(time.time() - t_start, 0.001)
+                    with lock:
+                        print(
+                            f"[images] {i}/{len(todo)}  ok={counters['ok']} "
+                            f"fail={counters['fail']} @ {rate:.1f}/s  last: {name} "
+                            f"({sz:,} bytes)" if status == "ok" else
+                            f"[images] {i}/{len(todo)}  FAIL {name}: {status[5:]}",
+                            flush=True,
+                        )
 
     elapsed = time.time() - t_start
     print(
-        f"\n[images] done in {elapsed:.1f}s: ok={ok}, fail={fail}, skipped={skipped}, "
+        f"\n[images] done in {elapsed:.1f}s: ok={counters['ok']}, "
+        f"fail={counters['fail']}, pre-skipped={skipped_before_start}, "
         f"out={out_dir}",
         flush=True,
     )
-    return 0 if fail == 0 else 1
+    return 0 if counters["fail"] == 0 else 1
 
 
 # --- argparse setup ----------------------------------------------------------
@@ -826,8 +890,9 @@ def build_parser() -> argparse.ArgumentParser:
     im.add_argument("--wiki-base", default="https://wiki.tgstation13.org", help="Wiki base URL prefix (no trailing slash). Default tgstation13. Used only by --input mode.")
     im.add_argument("--images-path", default="images", help="Path segment between wiki-base and the md5 directories. Default 'images'. Used only by --input mode.")
     im.add_argument("--user-agent", default=DEFAULT_UA)
-    im.add_argument("--delay", type=float, default=0.2, help="Seconds between downloads (default 0.2).")
-    im.add_argument("--overwrite", action="store_true", help="Re-download files that already exist locally.")
+    im.add_argument("--delay", type=float, default=0.2, help="Seconds between downloads PER WORKER (default 0.2). With --workers > 1 the effective request rate is workers/delay; e.g. --workers 8 --delay 0.2 -> ~40 req/s.")
+    im.add_argument("--workers", type=int, default=1, help="Number of concurrent download threads. Each thread gets its own curl_cffi session (curl_cffi.Session is not thread-safe). 1 (default) is serial; 4-8 is a good range for Cloudflare-friendly speeds without tripping rate limits.")
+    im.add_argument("--overwrite", action="store_true", help="Re-download files that already exist locally. Default is to skip existing files so partial-run resumes don't redo finished work.")
     im.add_argument("--limit", type=int, default=0, help="Stop after N files. 0 = unlimited.")
     im.add_argument("--progress-every", type=int, default=50, help="Print a heartbeat every N files (default 50).")
     im.set_defaults(func=cmd_images)
