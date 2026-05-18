@@ -254,25 +254,47 @@ def _open_maybe_gz(path: Path, mode: str):
 
 # --- Live fetcher (via Special:Export) ---------------------------------------
 
-def _http_session(user_agent: str, cookies: dict | None = None):
-    """Return a session-like object. Prefer curl_cffi.Session impersonating
-    Chrome (the only realistic way past Cloudflare). Fall back to requests
-    with a stern UA; the user will likely 403 but they'll see why.
+def _detect_impersonate(user_agent: str) -> str:
+    """Pick a curl_cffi impersonate target whose TLS fingerprint matches
+    the browser the User-Agent claims to be. cf_clearance cookies are
+    bound to the JA3/JA4 + UA combo that issued them; getting either
+    wrong fails the Cloudflare bot check.
 
-    `cookies` are pre-set on the session. For Cloudflare-walled hosts the
-    cf_clearance cookie (extracted from the user's already-cleared browser
-    session) is what lets the script bypass the JS challenge for static
-    asset paths that even curl_cffi's TLS impersonation can't clear on
-    its own.
+    Falls back to 'chrome' (the curl_cffi default) for unknown UAs.
     """
+    ua = (user_agent or "").lower()
+    # Order matters: Edge/Brave include 'chrome' too, so check those first.
+    if "edg/" in ua or "edge" in ua:
+        return "edge99"
+    if "firefox" in ua:
+        # curl_cffi 0.13 ships firefox135 as its latest profile; that's
+        # close enough to Firefox 133-150 for the JA3 check.
+        return "firefox135"
+    if "chrome" in ua:
+        return "chrome"
+    if "safari" in ua:
+        return "safari15_5"
+    return "chrome"
+
+
+def _http_session(user_agent: str, cookies: dict | None = None, impersonate: str | None = None):
+    """Return a session-like object. Prefer curl_cffi.Session with a
+    browser-matched TLS fingerprint. `impersonate` overrides the auto-
+    detection from `user_agent` for cases where the UA string doesn't
+    point at the right profile.
+
+    Falls back to plain `requests` (which 403s on Cloudflare-walled
+    hosts) when curl_cffi is not installed.
+    """
+    profile = impersonate or _detect_impersonate(user_agent)
     try:
         from curl_cffi import requests as cffi_requests  # type: ignore
-        sess = cffi_requests.Session(impersonate="chrome")
+        sess = cffi_requests.Session(impersonate=profile)
         sess.headers["User-Agent"] = user_agent
         if cookies:
             for k, v in cookies.items():
                 sess.cookies.set(k, v)
-        return ("curl_cffi", sess)
+        return (f"curl_cffi:{profile}", sess)
     except ImportError:
         import requests  # type: ignore
         sess = requests.Session()
@@ -659,7 +681,9 @@ def cmd_images(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cookies = _parse_cookies(args.cookie)
-    backend, sess = _http_session(args.user_agent, cookies=cookies)
+    backend, sess = _http_session(
+        args.user_agent, cookies=cookies, impersonate=args.impersonate,
+    )
     print(f"HTTP backend: {backend}; cookies set: {list(cookies)}")
     if backend != "curl_cffi":
         print(
@@ -797,6 +821,7 @@ def build_parser() -> argparse.ArgumentParser:
     im.add_argument("--api", default=DEFAULT_API, help=f"MediaWiki api.php URL for --discover-api mode (default {DEFAULT_API}).")
     im.add_argument("--output-dir", required=True, help="Directory to write downloaded files into. Files are saved with their canonical filename; importImages.php takes the directory as its argument.")
     im.add_argument("--cookie", default=None, help="Cookie string to attach to every request, e.g. 'cf_clearance=...' or 'a=1; b=2'. Needed to bypass Cloudflare on hosts where curl_cffi's TLS impersonation alone isn't enough (image asset paths in particular). Extract cf_clearance from your already-cleared browser session via DevTools.")
+    im.add_argument("--impersonate", default=None, help="curl_cffi impersonation profile (e.g. 'chrome', 'firefox135', 'edge99', 'safari15_5'). Default auto-detects from --user-agent. cf_clearance cookies are bound to a JA3+UA pair, so the TLS fingerprint of the request MUST match the browser the cookie was issued to.")
     im.add_argument("--cutoff", default=None, help=f"ISO 8601 cutoff. With --discover-api, skip files first uploaded after this date. Default no cutoff. To match the filter policy use {DEFAULT_CUTOFF}.")
     im.add_argument("--wiki-base", default="https://wiki.tgstation13.org", help="Wiki base URL prefix (no trailing slash). Default tgstation13. Used only by --input mode.")
     im.add_argument("--images-path", default="images", help="Path segment between wiki-base and the md5 directories. Default 'images'. Used only by --input mode.")
