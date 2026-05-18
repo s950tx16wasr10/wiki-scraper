@@ -1,0 +1,11 @@
+# Only needed by the `fetch` subcommand. The `filter` subcommand uses
+# only the Python stdlib. The `wayback` subcommand uses one of these for
+# the Internet Archive HTTP calls but tolerates either backend.
+#
+# curl_cffi: required to clear Cloudflare's managed-challenge wall on the
+# tgstation13 wiki. Without it, every Special:Export hit returns HTTP 403.
+curl_cffi >= 0.7
+
+# Plain requests as a soft fallback for the `wayback` subcommand
+# (web.archive.org is not Cloudflare-walled).
+requests >= 2.31
