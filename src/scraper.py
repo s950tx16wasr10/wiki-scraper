@@ -254,20 +254,50 @@ def _open_maybe_gz(path: Path, mode: str):
 
 # --- Live fetcher (via Special:Export) ---------------------------------------
 
-def _http_session(user_agent: str):
+def _http_session(user_agent: str, cookies: dict | None = None):
     """Return a session-like object. Prefer curl_cffi.Session impersonating
     Chrome (the only realistic way past Cloudflare). Fall back to requests
-    with a stern UA; the user will likely 403 but they'll see why."""
+    with a stern UA; the user will likely 403 but they'll see why.
+
+    `cookies` are pre-set on the session. For Cloudflare-walled hosts the
+    cf_clearance cookie (extracted from the user's already-cleared browser
+    session) is what lets the script bypass the JS challenge for static
+    asset paths that even curl_cffi's TLS impersonation can't clear on
+    its own.
+    """
     try:
         from curl_cffi import requests as cffi_requests  # type: ignore
         sess = cffi_requests.Session(impersonate="chrome")
         sess.headers["User-Agent"] = user_agent
+        if cookies:
+            for k, v in cookies.items():
+                sess.cookies.set(k, v)
         return ("curl_cffi", sess)
     except ImportError:
         import requests  # type: ignore
         sess = requests.Session()
         sess.headers["User-Agent"] = user_agent
+        if cookies:
+            for k, v in cookies.items():
+                sess.cookies.set(k, v)
         return ("requests", sess)
+
+
+def _parse_cookies(spec: str | None) -> dict:
+    """Parse a `name=value; name2=value2` style cookie string into a dict.
+    Accepts a single name=value too. Empty/None returns {}."""
+    if not spec:
+        return {}
+    out: dict[str, str] = {}
+    for part in spec.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            continue
+        name, _, value = part.partition("=")
+        out[name.strip()] = value.strip()
+    return out
 
 
 def list_all_pages(api_url: str, namespace: int, user_agent: str, delay: float) -> Iterator[dict]:
@@ -586,19 +616,51 @@ def iter_file_titles(in_path: Path) -> Iterator[str]:
         src.close()
 
 
+def discover_all_images(api_url: str, sess, cutoff: dt.datetime | None) -> Iterator[dict]:
+    """Stream every (name, url, timestamp) tuple via api.php list=allimages.
+    Filters by cutoff if given (drops files first uploaded after it).
+
+    yields: {"name": str, "url": str, "timestamp": datetime}
+    """
+    cont: dict = {}
+    while True:
+        params = {
+            "action": "query",
+            "format": "json",
+            "list": "allimages",
+            "ailimit": "max",
+            "aiprop": "url|timestamp|size",
+            "aisort": "name",
+            **cont,
+        }
+        r = sess.get(f"{api_url}?{urlencode(params)}", timeout=30)
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"allimages returned HTTP {r.status_code}. Cookie likely "
+                f"missing/expired; refresh cf_clearance from your browser."
+            )
+        data = r.json()
+        for img in data.get("query", {}).get("allimages", []):
+            try:
+                ts = parse_ts(img["timestamp"])
+            except Exception:
+                continue
+            if cutoff is not None and ts > cutoff:
+                continue
+            yield {"name": img["name"], "url": img["url"], "timestamp": ts}
+        if "continue" in data:
+            cont = data["continue"]
+        else:
+            break
+
+
 def cmd_images(args: argparse.Namespace) -> int:
-    in_path = Path(args.input)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    titles = list(iter_file_titles(in_path))
-    print(f"Found {len(titles)} File-namespace pages in {in_path}")
-    if args.limit:
-        titles = titles[: args.limit]
-        print(f"Limiting to first {len(titles)} for this run.")
-
-    backend, sess = _http_session(args.user_agent)
-    print(f"HTTP backend: {backend}")
+    cookies = _parse_cookies(args.cookie)
+    backend, sess = _http_session(args.user_agent, cookies=cookies)
+    print(f"HTTP backend: {backend}; cookies set: {list(cookies)}")
     if backend != "curl_cffi":
         print(
             "WARNING: curl_cffi not installed; Cloudflare will likely 403. "
@@ -606,25 +668,66 @@ def cmd_images(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # Two discovery modes:
+    #   --discover-api  -> use api.php list=allimages (gets EVERY file on the
+    #                       wiki, not just what's in the XML)
+    #   --input xml     -> walk ns=6 pages in a given Special:Export XML
+    targets: list[dict] = []
+    if args.discover_api:
+        cutoff = parse_ts(args.cutoff) if args.cutoff else None
+        print(f"Discovering files via api.php list=allimages "
+              f"(cutoff={fmt_ts(cutoff) if cutoff else 'none'})...")
+        try:
+            for entry in discover_all_images(args.api, sess, cutoff):
+                targets.append(entry)
+                if len(targets) % 500 == 0:
+                    print(f"  ... {len(targets)} files enumerated so far", flush=True)
+        except RuntimeError as exc:
+            print(f"FAIL discover: {exc}", file=sys.stderr)
+            return 2
+        print(f"Discovered {len(targets)} files via API.")
+    elif args.input:
+        in_path = Path(args.input)
+        for name in iter_file_titles(in_path):
+            a, ab, canon = file_disk_path(name)
+            url = (
+                f"{args.wiki_base.rstrip('/')}/"
+                f"{args.images_path.strip('/')}/{a}/{ab}/{quote(canon)}"
+            )
+            targets.append({"name": canon, "url": url, "timestamp": None})
+        print(f"Found {len(targets)} File-namespace pages in {in_path}.")
+    else:
+        print("error: provide either --discover-api or --input.", file=sys.stderr)
+        return 2
+
+    if args.limit:
+        targets = targets[: args.limit]
+        print(f"Limiting to first {len(targets)} for this run.")
+
     ok = 0
     fail = 0
     skipped = 0
     t_start = time.time()
 
-    for i, name in enumerate(titles, start=1):
-        a, ab, canon = file_disk_path(name)
-        url = f"{args.wiki_base.rstrip('/')}/{args.images_path.strip('/')}/{a}/{ab}/{quote(canon)}"
-        out_path = out_dir / canon
+    for i, entry in enumerate(targets, start=1):
+        name = entry["name"]
+        url = entry["url"]
+        # MediaWiki API returns the filename with underscores; preserve that
+        # because importImages.php matches by exact filename including case.
+        out_path = out_dir / name
         if out_path.exists() and not args.overwrite:
             skipped += 1
             if i % args.progress_every == 0:
-                print(f"[images] {i}/{len(titles)}  skipped (already on disk)")
+                print(
+                    f"[images] {i}/{len(targets)}  skip already-on-disk: {name}",
+                    flush=True,
+                )
             continue
         try:
-            r = sess.get(url, timeout=30)
+            r = sess.get(url, timeout=60)
         except Exception as exc:
             fail += 1
-            print(f"[images] {i}/{len(titles)}  FAIL {name}: {exc}", flush=True)
+            print(f"[images] {i}/{len(targets)}  FAIL {name}: {exc}", flush=True)
             time.sleep(args.delay)
             continue
         if r.status_code == 200 and r.content:
@@ -633,14 +736,14 @@ def cmd_images(args: argparse.Namespace) -> int:
             if i % args.progress_every == 0:
                 rate = i / max(time.time() - t_start, 0.001)
                 print(
-                    f"[images] {i}/{len(titles)}  ok={ok} fail={fail} skip={skipped} "
-                    f"@ {rate:.1f}/s  last: {canon} ({len(r.content):,} bytes)",
+                    f"[images] {i}/{len(targets)}  ok={ok} fail={fail} skip={skipped} "
+                    f"@ {rate:.1f}/s  last: {name} ({len(r.content):,} bytes)",
                     flush=True,
                 )
         else:
             fail += 1
             print(
-                f"[images] {i}/{len(titles)}  FAIL {name}: HTTP {r.status_code}",
+                f"[images] {i}/{len(targets)}  FAIL {name}: HTTP {r.status_code}",
                 flush=True,
             )
         time.sleep(args.delay)
@@ -687,11 +790,16 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--user-agent", default=DEFAULT_UA)
     w.set_defaults(func=cmd_wayback)
 
-    im = sub.add_parser("images", help="Download File-namespace binaries referenced in an export XML.")
-    im.add_argument("--input", required=True, help="Path to an export XML (.xml or .xml.gz). Filtered or raw both work.")
+    im = sub.add_parser("images", help="Download File-namespace binaries.")
+    src = im.add_mutually_exclusive_group(required=True)
+    src.add_argument("--input", help="Path to an export XML (.xml or .xml.gz). Only downloads File: pages present in the XML. Uses md5(canonical) to guess /images/<a>/<ab>/<file> paths.")
+    src.add_argument("--discover-api", action="store_true", help="Discover EVERY file on the wiki via api.php list=allimages. Recommended when you want the full image set, not just what's in a partial export. Uses the URL returned by the API directly (no path-guessing).")
+    im.add_argument("--api", default=DEFAULT_API, help=f"MediaWiki api.php URL for --discover-api mode (default {DEFAULT_API}).")
     im.add_argument("--output-dir", required=True, help="Directory to write downloaded files into. Files are saved with their canonical filename; importImages.php takes the directory as its argument.")
-    im.add_argument("--wiki-base", default="https://wiki.tgstation13.org", help="Wiki base URL prefix (no trailing slash). Default tgstation13.")
-    im.add_argument("--images-path", default="images", help="Path segment between wiki-base and the md5 directories. Most wikis use 'images'; some use 'w/images'. Default 'images'.")
+    im.add_argument("--cookie", default=None, help="Cookie string to attach to every request, e.g. 'cf_clearance=...' or 'a=1; b=2'. Needed to bypass Cloudflare on hosts where curl_cffi's TLS impersonation alone isn't enough (image asset paths in particular). Extract cf_clearance from your already-cleared browser session via DevTools.")
+    im.add_argument("--cutoff", default=None, help=f"ISO 8601 cutoff. With --discover-api, skip files first uploaded after this date. Default no cutoff. To match the filter policy use {DEFAULT_CUTOFF}.")
+    im.add_argument("--wiki-base", default="https://wiki.tgstation13.org", help="Wiki base URL prefix (no trailing slash). Default tgstation13. Used only by --input mode.")
+    im.add_argument("--images-path", default="images", help="Path segment between wiki-base and the md5 directories. Default 'images'. Used only by --input mode.")
     im.add_argument("--user-agent", default=DEFAULT_UA)
     im.add_argument("--delay", type=float, default=0.2, help="Seconds between downloads (default 0.2).")
     im.add_argument("--overwrite", action="store_true", help="Re-download files that already exist locally.")
