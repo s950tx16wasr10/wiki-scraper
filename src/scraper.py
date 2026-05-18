@@ -128,22 +128,25 @@ def closest_revision(
 
 
 def filter_export(
-    in_path: Path, out_path: Path, target: dt.datetime, cutoff: dt.datetime
+    in_path: Path, out_path: Path, target: dt.datetime, cutoff: dt.datetime,
+    progress_every: int = 500,
 ) -> dict:
     """Read a Special:Export full-history XML at in_path, drop every revision
     that isn't the closest-to-target<=cutoff one for its page, drop pages
     with no eligible revision, write the result to out_path. Returns a stats
-    dict."""
+    dict.
+
+    Prints a one-line progress every `progress_every` pages (set to 0 to
+    silence). On a multi-hundred-MB dump the iterparse pass takes minutes;
+    without the heartbeat it's indistinguishable from a hang."""
     ET.register_namespace("", MW_NS)
 
-    # iterparse() lets us process huge dumps without loading them whole.
-    # We hand-build the output tree so we can copy <siteinfo> verbatim and
-    # filter <page> elements as we walk.
     src = _open_maybe_gz(in_path, "rb")
+    t_start = time.time()
     try:
+        # iterparse streams the document; we never hold the full tree in memory.
         context = ET.iterparse(src, events=("start", "end"))
         _, root_in = next(context)  # the wrapper <mediawiki> element
-        # Reset attrs on out root to match in root.
         root_out = ET.Element(root_in.tag, attrib=root_in.attrib)
 
         stats = {
@@ -159,14 +162,12 @@ def filter_export(
             if event != "end":
                 continue
             tag = elem.tag
-            # Strip namespace for the comparison so we work with or without xmlns
             local = tag.split("}", 1)[-1] if "}" in tag else tag
 
             if local == "siteinfo":
                 # Copy <siteinfo> verbatim — importDump.php uses this for
                 # base URL, namespace mappings, and generator metadata.
                 root_out.append(elem)
-                # detach from in-tree to free memory
                 root_in.remove(elem)
                 continue
 
@@ -177,29 +178,50 @@ def filter_export(
             revs = list(iter_revs(elem))
             stats["revisions_seen"] += len(revs)
             chosen = closest_revision(elem, target, cutoff)
+            title = get_text(elem, "title") or "?"
             if chosen is None:
-                # Either no revisions at all (rare) or all revisions are
-                # after cutoff (page created in 2022+).
                 if revs:
                     stats["pages_dropped_after_cutoff"] += 1
                 else:
                     stats["pages_dropped_no_revision"] += 1
             else:
-                # Remove every revision except the chosen one.
                 for r in revs:
                     if r is not chosen:
                         elem.remove(r)
                 root_out.append(_clone(elem))
                 stats["pages_kept"] += 1
                 stats["revisions_kept"] += 1
+
+            if progress_every and stats["pages_seen"] % progress_every == 0:
+                rate = stats["pages_seen"] / max(time.time() - t_start, 0.001)
+                print(
+                    f"[filter] {stats['pages_seen']:>6} pages seen "
+                    f"({stats['pages_kept']} kept, "
+                    f"{stats['pages_dropped_after_cutoff']} too-new) "
+                    f"@ {rate:.0f} pages/s  last: {title[:60]!r}",
+                    flush=True,
+                )
             # Drop the page from the in-tree to keep memory flat.
             root_in.clear()
 
+        elapsed = time.time() - t_start
+        print(
+            f"[filter] done in {elapsed:.1f}s: "
+            f"{stats['pages_seen']} pages seen, "
+            f"{stats['pages_kept']} kept, "
+            f"{stats['revisions_seen']} revisions seen, "
+            f"{stats['revisions_kept']} kept",
+            flush=True,
+        )
+
         tree = ET.ElementTree(root_out)
-        # ET.write doesn't pretty-print by default; that's fine, importDump
-        # doesn't care about whitespace and a tighter file imports faster.
+        print(f"[filter] writing {out_path}", flush=True)
         with _open_maybe_gz(out_path, "wb") as f:
             tree.write(f, encoding="utf-8", xml_declaration=True)
+        print(
+            f"[filter] wrote {out_path} ({out_path.stat().st_size:,} bytes)",
+            flush=True,
+        )
         return stats
     finally:
         src.close()
